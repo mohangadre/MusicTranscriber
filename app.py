@@ -14,7 +14,6 @@ from collections import Counter
 from scipy.signal import find_peaks
 import soundfile as sf
 
-
 # Configure logging
 logging.basicConfig(
    level=logging.INFO,
@@ -28,7 +27,44 @@ AudioSegment.converter = "/opt/homebrew/bin/ffmpeg"
 AudioSegment.ffmpeg = "/opt/homebrew/bin/ffmpeg"
 AudioSegment.ffprobe = "/opt/homebrew/bin/ffprobe"
 
+# Instead of hardcoding the ffmpeg path, we could also implement a check to see if ffmpeg is available in the system PATH and use it directly. Right now, running this locally causes no issues, but would break on some machines upon deployment, specifically for MP3 and M4A files. WAV files remain unaffected as they skip the pydub conversion.
+# Using a dynamic configuration approach would make the code more portable across different environments without requiring users to modify the code for their specific ffmpeg installation.
 
+'''
+import shutil
+
+def _configure_ffmpeg():
+    candidate = shutil.which("ffmpeg")
+    
+    if candidate is None:
+        fallback = [
+            "/opt/homebrew/bin/ffmpeg", # macOS for older Apple machines
+            "/usr/local/bin/ffmpeg",    # Intel or manual installations
+            "/usr/bin/ffmpeg",          # Linux
+        ]
+        
+        for path in fallback:
+            if os.path.isfile(path):
+                candidate = path
+                break
+    
+    if candidate is None:
+        logger.warning(
+            "ffmpeg not found. MP3 and M4A files will not be supported."
+            "Install ffmpeg and ensure it's in your system PATH."
+        )
+        return
+    
+    AudioSegment.converter = candidate
+    AudioSegment.ffmpeg = candidate
+    
+    ffprobe = shutil.which("ffprobe") or candidate.replace("ffmpeg", "ffprobe")
+    AudioSegment.ffprobe = ffprobe
+    
+    logger.info(f"ffmpeg configured: {candidate}")
+
+_configure_ffmpeg()
+'''
 
 
 # ---------------------------------------------------------------------------
@@ -160,7 +196,7 @@ def detect_notes_framewise(y, sr):
        if len(seg) > 0:
            frame_rms[t] = float(np.sqrt(np.mean(seg ** 2)))
    global_rms = float(np.sqrt(np.mean(y ** 2)))
-   noise_floor = global_rms * 0.08
+   noise_floor = global_rms * 0.08  # 8% of global RMS as noise floor (tunable)
    logger.info(f"RMS noise floor: {noise_floor:.6f}  (global RMS={global_rms:.6f})")
 
 
@@ -188,7 +224,7 @@ def detect_notes_framewise(y, sr):
            continue
        col = C[:, t]
        col_max = col.max()
-       if col_max == 0 or col_max < global_cqt_max * 0.03:
+       if col_max == 0 or col_max < global_cqt_max * 0.03: # 3% of global max as another gate
            frame_notes.append(set())
            frame_octave_rejections.append([])
            continue
@@ -920,6 +956,10 @@ def analyze_audio(audio_file):
 
        # Convert non-WAV formats via pydub
        if file_ext in ('.mp3', '.m4a'):
+           # Include guard against pydub not supporting the format (e.g. missing ffmpeg):
+           # if AudioSegment.ffmpeg is None or not os.path.isfile(AudioSegment.ffmpeg):
+           #    raise RuntimeError(f"Cannot convert {file_ext} to WAV: pydub does not have ffmpeg support.")
+           # )
            logger.info(f"Converting {file_ext} to WAV...")
            if file_ext == '.mp3':
                audio_seg = AudioSegment.from_mp3(tmp_path)
@@ -968,6 +1008,7 @@ def analyze_audio(audio_file):
 
 
        # --- Spectral features ------------------------------------------------
+       # If we plan to use this for audio files that include anything other than piano, we could implement these features for an instrument detection. 
        spectral_centroids = librosa.feature.spectral_centroid(y=y, sr=sr)[0]
        spectral_rolloff = librosa.feature.spectral_rolloff(y=y, sr=sr)[0]
 
@@ -1070,7 +1111,7 @@ def generate_midi(audio_analysis, filename):
    """Generate a MIDI file from the detected note events."""
    logger.info(f"Generating MIDI for: {filename}")
 
-
+    # Hardcoding initial_tempo to 120 BPM is simple, but we could also use the detected tempo from the analysis if desired. This way, opening the MIDI in a DAW would reflect the original tempo of the audio.
    midi = pretty_midi.PrettyMIDI(initial_tempo=120.0, resolution=960)
    instrument = pretty_midi.Instrument(program=0)  # Acoustic Grand Piano
 
