@@ -886,9 +886,10 @@ def detect_notes_framewise(y, sr):
 
    return note_events, f0, voiced_flag, voiced_probs, cqt_times
 
-
-
-
+'''
+50ms minimum duration one problem when transcribing "Für Elise" – the short grace notes get filtered out.  We could consider lowering this threshold to about 25ms or by making it adaptive based on tempo."
+"Für Elise" has plenty of rapid 16th and 32nd notes which we saw were not being transcribed in the output.
+'''
 def _emit_note(note_events, pitch, start_frame, end_frame, cqt_times, C,
               fmin_midi, num_frames, global_cqt_max, min_duration=0.05):
    """Helper: create a note event if it meets minimum duration and energy."""
@@ -913,6 +914,13 @@ def _emit_note(note_events, pitch, start_frame, end_frame, cqt_times, C,
    # Reject notes whose onset energy is < 5% of global CQT max
    if onset_energy < global_cqt_max * 0.05:
        return
+   '''
+   A short note that barely survives the duration check above gets fitered out here.
+   This 5% energy gate is currently filtering out the grace notes in "Für Elise". We should consider lowering this threshold to 1% or by also making it adaptive based on tempo.
+   
+   A potential issue that might arise from lowering to 1% is that we might start finding too many false positives in the output. If min_duration is changed, we should leave it as that but instead change this energy gate.
+   '''
+   
 
 
    vel_raw = int(np.clip(onset_energy / global_cqt_max * 127, 20, 127))
@@ -1435,11 +1443,5 @@ def main():
            st.write("No files uploaded yet")
 
 
-
-
 if __name__ == "__main__":
    main()
-
-
-
-
