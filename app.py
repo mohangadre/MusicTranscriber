@@ -73,9 +73,7 @@ _configure_ffmpeg()
 
 
 def midi_to_note_name(midi_number):
-   """Convert MIDI note number to note name (e.g. 60 -> 'C3').
-   Uses the DAW-standard convention where MIDI 60 = C3 (matching
-   most piano-roll displays like Ableton, FL Studio, etc.)."""
+
    if midi_number < 0 or midi_number > 127:
        return "N/A"
    notes = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B']
@@ -83,6 +81,9 @@ def midi_to_note_name(midi_number):
    note = notes[midi_number % 12]
    return f"{note}{octave}"
 
+   """Convert MIDI note number to note name (e.g. 60 -> 'C3').
+   Uses the DAW-standard convention where MIDI 60 = C3 (matching
+   most piano-roll displays like Ableton, FL Studio, etc.)."""
 
 
 
@@ -374,8 +375,8 @@ def detect_notes_framewise(y, sr):
            _, _, bp_note_events = bp_predict(
                bp_tmp.name,
                model_or_model_path=bp_model,
-               onset_threshold=0.5,
-               frame_threshold=0.3,
+               onset_threshold=0.6,
+               frame_threshold=0.5,
                minimum_note_length=50.0,
            )
        finally:
@@ -767,9 +768,19 @@ def detect_notes_framewise(y, sr):
    if bp_ranges and bp_bass_notes:
        bp_bass_pitches = set(p for p in bp_ranges if p < BASS_DIRECT_CUTOFF)
 
-       # Step 0: filter octave-harmonic overtones
+       # Step 0: filter octave-harmonic overtones (duration-aware)
+       # Only filter the upper pitch if the lower pitch has substantial
+       # BP coverage relative to the upper.  If the lower is just a brief
+       # pedal note and the upper is a core melodic/harmonic note, keep both.
        OCTAVE_INTERVALS = {12, 24, 36}
+       OVERTONE_RATIO = 0.25  # lower must have ≥25% of upper's total duration
        overtone_pitches = set()
+
+       def _total_bp_dur(pitch):
+           return sum(
+               cqt_times[min(e, num_frames - 1)] - cqt_times[min(s, num_frames - 1)]
+               for s, e in bp_ranges.get(pitch, []))
+
        for p in sorted(bp_bass_pitches):
            for lower_p in bp_bass_pitches:
                if lower_p >= p:
@@ -780,12 +791,22 @@ def detect_notes_framewise(y, sr):
                lower_segs = bp_ranges[lower_p]
                p_min = min(s for s, _ in p_segs)
                p_max = max(e for _, e in p_segs)
-               if any(s <= p_max and e >= p_min for s, e in lower_segs):
-                   overtone_pitches.add(p)
+               if not any(s <= p_max and e >= p_min for s, e in lower_segs):
+                   continue
+               upper_dur = _total_bp_dur(p)
+               lower_dur = _total_bp_dur(lower_p)
+               if upper_dur > 0 and lower_dur / upper_dur < OVERTONE_RATIO:
                    logger.info(
                        f"  BP bass overtone filter: {midi_to_note_name(p)} "
-                       f"is octave of {midi_to_note_name(lower_p)} → skipped")
-                   break
+                       f"kept — {midi_to_note_name(lower_p)} too brief "
+                       f"({lower_dur:.1f}s vs {upper_dur:.1f}s)")
+                   continue
+               overtone_pitches.add(p)
+               logger.info(
+                   f"  BP bass overtone filter: {midi_to_note_name(p)} "
+                   f"is octave of {midi_to_note_name(lower_p)} → skipped "
+                   f"({lower_dur:.1f}s vs {upper_dur:.1f}s)")
+               break
 
        bp_valid_bass = bp_bass_pitches - overtone_pitches
 
@@ -880,6 +901,67 @@ def detect_notes_framewise(y, sr):
                    f"{len(bp_bass_events)} BP-derived bass events")
        note_events = melody_events + bp_bass_events
 
+   # --- Soft BP validation: reject weak CQT-only hallucinations ------------
+   # The CQT often hallucinates harmonics as real notes (e.g. E3 when E5 is
+   # playing).  These hallucinations have *weak* CQT energy (5–12% of max),
+   # while real notes that BP might miss (rapid trills) have *strong* energy.
+   # Strategy: if BP confirms a note → keep.  If BP doesn't confirm but the
+   # note's CQT onset energy is strong (≥15% of global max) → keep anyway.
+   # Only reject notes that are BOTH BP-unconfirmed AND CQT-weak.
+   if bp_ranges:
+       validated_events = []
+       bp_rejected = 0
+       bp_kept_strong = 0
+       frame_dur = hop / sr
+       BP_TOLERANCE = 2        # ±2 frames (~21ms) alignment tolerance
+       STRONG_CQT = 0.15       # 15% of global CQT max = strong enough without BP
+
+       for note in note_events:
+           bp_segs = bp_ranges.get(note['pitch'], [])
+
+           note_sf = int(round(note['start'] / frame_dur))
+           note_ef = int(round(note['end'] / frame_dur))
+
+           has_bp = bool(bp_segs) and any(
+               sf - BP_TOLERANCE <= note_ef and ef + BP_TOLERANCE >= note_sf
+               for sf, ef in bp_segs)
+
+           if has_bp:
+               validated_events.append(note)
+               continue
+
+           # No BP confirmation — check CQT onset energy
+           bin_idx = note['pitch'] - fmin_midi
+           energy_ratio = 0.0
+           if 0 <= bin_idx < C.shape[0]:
+               sf_c = max(0, min(note_sf, num_frames - 1))
+               onset_end = min(sf_c + 5, num_frames)
+               if onset_end > sf_c:
+                   onset_energy = float(np.mean(C[bin_idx, sf_c:onset_end]))
+                   energy_ratio = onset_energy / global_cqt_max
+
+           if energy_ratio >= STRONG_CQT:
+               validated_events.append(note)
+               bp_kept_strong += 1
+               logger.info(
+                   f"  BP pass (strong CQT): "
+                   f"{midi_to_note_name(note['pitch'])} "
+                   f"{note['start']:.3f}–{note['end']:.3f}s "
+                   f"energy={energy_ratio:.1%}")
+           else:
+               bp_rejected += 1
+               logger.info(
+                   f"  BP reject (weak+no BP): "
+                   f"{midi_to_note_name(note['pitch'])} "
+                   f"{note['start']:.3f}–{note['end']:.3f}s "
+                   f"energy={energy_ratio:.1%}")
+
+       if bp_rejected > 0 or bp_kept_strong > 0:
+           logger.info(
+               f"BP validation: {len(note_events)} → {len(validated_events)} "
+               f"({bp_rejected} rejected, {bp_kept_strong} kept via strong CQT)")
+       note_events = validated_events
+
    note_events.sort(key=lambda n: (n['start'], n['pitch']))
    logger.info(f"Final note events: {len(note_events)}")
 
@@ -891,7 +973,7 @@ def detect_notes_framewise(y, sr):
 "Für Elise" has plenty of rapid 16th and 32nd notes which we saw were not being transcribed in the output.
 '''
 def _emit_note(note_events, pitch, start_frame, end_frame, cqt_times, C,
-              fmin_midi, num_frames, global_cqt_max, min_duration=0.05):
+              fmin_midi, num_frames, global_cqt_max, min_duration=0.03):
    """Helper: create a note event if it meets minimum duration and energy."""
    sf = max(start_frame, 0)
    ef = min(end_frame, num_frames - 1)
