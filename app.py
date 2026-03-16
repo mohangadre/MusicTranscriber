@@ -375,8 +375,8 @@ def detect_notes_framewise(y, sr):
            _, _, bp_note_events = bp_predict(
                bp_tmp.name,
                model_or_model_path=bp_model,
-               onset_threshold=0.6,
-               frame_threshold=0.5,
+               onset_threshold=0.5,
+               frame_threshold=0.3,
                minimum_note_length=50.0,
            )
        finally:
@@ -1028,6 +1028,206 @@ def _emit_note(note_events, pitch, start_frame, end_frame, cqt_times, C,
 
 
 # ---------------------------------------------------------------------------
+# Onsets-and-Frames transcription (ByteDance / PyTorch)
+# ---------------------------------------------------------------------------
+
+def detect_notes_onsets_frames(y, sr):
+   """Use ByteDance's high-resolution Onsets-and-Frames model to transcribe
+   piano audio directly to note events.  Returns the same format as
+   detect_notes_framewise:
+       (note_events, f0, voiced_flag, voiced_probs, times)
+   Raises ImportError if the package is not installed."""
+
+   import torch
+   from piano_transcription_inference import PianoTranscription, sample_rate as PT_SR
+
+   logger.info("=" * 80)
+   logger.info("Using Onsets-and-Frames (ByteDance) for transcription")
+   logger.info("=" * 80)
+
+   if sr != PT_SR:
+       logger.info(f"Resampling {sr} Hz → {PT_SR} Hz for O&F model...")
+       y_rs = librosa.resample(y, orig_sr=sr, target_sr=PT_SR)
+   else:
+       y_rs = y
+
+   transcriptor = PianoTranscription(device=torch.device('cpu'),
+                                     checkpoint_path=None)
+   transcriptor.onset_threshold = 0.5
+   transcriptor.frame_threshold = 0.2
+
+   logger.info("Running Onsets-and-Frames inference (onset=0.5, frame=0.2)...")
+   transcribed = transcriptor.transcribe(y_rs, midi_path=None)
+
+   est_notes = transcribed['est_note_events']
+   logger.info(f"O&F raw output: {len(est_notes)} note events")
+
+   note_events = []
+   for ev in est_notes:
+       onset = float(ev['onset_time'])
+       offset = float(ev['offset_time'])
+       midi_note = int(ev['midi_note'])
+       vel = int(np.clip(ev['velocity'], 1, 127))
+
+       dur = offset - onset
+       if dur < 0.03:
+           continue
+       if dur < 0.12 and vel < 50:
+           continue
+
+       note_events.append({
+           'pitch': midi_note,
+           'start': onset,
+           'end': offset,
+           'velocity_raw': vel,
+       })
+
+   note_events.sort(key=lambda n: (n['start'], n['pitch']))
+   logger.info(f"O&F note events after basic filtering: {len(note_events)}")
+
+   # --- Patch: detect the first note near t=0 that O&F misses --------------
+   EARLY_THRESHOLD = 0.15
+   first_of_onset = note_events[0]['start'] if note_events else 0.0
+
+   if first_of_onset > EARLY_THRESHOLD:
+       logger.info(f"O&F first note starts at {first_of_onset:.3f}s — "
+                   f"detecting opening note with CQT...")
+       fmin_hz = librosa.note_to_hz('C2')
+       fmin_midi_e = int(round(librosa.hz_to_midi(fmin_hz)))
+       scan_samples = min(int(first_of_onset * sr), len(y))
+       C_early = np.abs(librosa.cqt(
+           y[:scan_samples], sr=sr, fmin=fmin_hz, n_bins=84,
+           hop_length=512, bins_per_octave=12))
+       strongest_bin = int(np.argmax(np.mean(C_early, axis=1)))
+       first_pitch = fmin_midi_e + strongest_bin
+
+       note_events.insert(0, {
+           'pitch': int(first_pitch),
+           'start': 0.0,
+           'end': float(first_of_onset - 0.005),
+           'velocity_raw': 70,
+       })
+       logger.info(f"  Inserted opening note: {midi_to_note_name(first_pitch)} "
+                   f"0.000–{first_of_onset - 0.005:.3f}s")
+
+   # --- Post-processing: remove weak phantom notes --------------------------
+   # When a weak note (low velocity) starts within 100ms of a much stronger
+   # note, it's almost certainly a harmonic phantom.  Remove it, then extend
+   # any short strong note that was truncated by the phantom's presence.
+   PHANTOM_WINDOW = 0.10
+   PHANTOM_VEL_RATIO = 0.55
+   phantoms = set()
+
+   for i, a in enumerate(note_events):
+       for j, b in enumerate(note_events):
+           if i == j:
+               continue
+           gap = abs(b['start'] - a['start'])
+           if gap > PHANTOM_WINDOW:
+               continue
+           if (a['velocity_raw'] > 0 and
+               b['velocity_raw'] / a['velocity_raw'] < PHANTOM_VEL_RATIO and
+               b['velocity_raw'] < 50):
+               phantoms.add(j)
+               logger.info(
+                   f"  Phantom removed: {midi_to_note_name(b['pitch'])} "
+                   f"{b['start']:.3f}s vel={b['velocity_raw']} "
+                   f"(near {midi_to_note_name(a['pitch'])} vel={a['velocity_raw']})")
+
+   if phantoms:
+       note_events = [n for i, n in enumerate(note_events) if i not in phantoms]
+       note_events.sort(key=lambda n: (n['start'], n['pitch']))
+       logger.info(f"Phantom removal: {len(phantoms)} notes removed")
+
+   # Extend short strong notes to fill gaps left by removed phantoms
+   all_starts = sorted(set(n['start'] for n in note_events))
+   for n in note_events:
+       dur = n['end'] - n['start']
+       if dur < 0.15 and n['velocity_raw'] >= 50:
+           later = [t for t in all_starts if t > n['start'] + 0.05]
+           if later:
+               new_end = later[0] - 0.005
+               if new_end > n['end']:
+                   logger.info(
+                       f"  Extended {midi_to_note_name(n['pitch'])} "
+                       f"{n['start']:.3f}s: {n['end']:.3f}→{new_end:.3f}s")
+                   n['end'] = new_end
+
+   # --- Post-processing: trim overlapping same-pitch notes ------------------
+   from collections import defaultdict
+   by_pitch = defaultdict(list)
+   for n in note_events:
+       by_pitch[n['pitch']].append(n)
+
+   for pitch, pnotes in by_pitch.items():
+       pnotes.sort(key=lambda n: n['start'])
+       for j in range(len(pnotes) - 1):
+           if pnotes[j]['end'] > pnotes[j + 1]['start']:
+               pnotes[j]['end'] = pnotes[j + 1]['start'] - 0.005
+
+   # --- Post-processing: clip notes in rapid passages -----------------------
+   # When notes arrive faster than 300ms apart, the model tends to hold
+   # offsets too long.  Clip each note so it doesn't extend past the next
+   # onset on ANY pitch by more than a small overlap allowance.
+   all_onsets = sorted(set(n['start'] for n in note_events))
+   RAPID_GAP = 0.30
+   OVERLAP_ALLOW = 0.03
+
+   for n in note_events:
+       next_onsets = [t for t in all_onsets if t > n['start'] + 0.01]
+       if not next_onsets:
+           continue
+       next_t = next_onsets[0]
+       gap = next_t - n['start']
+       if gap < RAPID_GAP and n['end'] > next_t + OVERLAP_ALLOW:
+           n['end'] = next_t + OVERLAP_ALLOW
+
+   # --- Post-processing: cap tail notes that sustain into silence -----------
+   audio_dur = len(y) / sr
+   rms = librosa.feature.rms(y=y, hop_length=512)[0]
+   silence_threshold = float(np.max(rms) * 0.02)
+   last_active_frame = len(rms) - 1
+   for k in range(len(rms) - 1, -1, -1):
+       if rms[k] > silence_threshold:
+           last_active_frame = k
+           break
+   last_active_time = float(librosa.frames_to_time(
+       last_active_frame, sr=sr, hop_length=512)) + 0.5
+
+   trimmed_tail = 0
+   for n in note_events:
+       if n['end'] > last_active_time:
+           n['end'] = last_active_time
+           trimmed_tail += 1
+
+   note_events = [n for n in note_events
+                  if (n['end'] - n['start'] >= 0.12) or
+                     (n['end'] - n['start'] >= 0.03 and n['velocity_raw'] >= 50)]
+   note_events.sort(key=lambda n: (n['start'], n['pitch']))
+
+   logger.info(f"O&F post-processed: {len(note_events)} events "
+               f"(tail-trimmed: {trimmed_tail})")
+
+   for i, n in enumerate(note_events[:40]):
+       name = midi_to_note_name(n['pitch'])
+       dur_ms = (n['end'] - n['start']) * 1000
+       logger.info(f"  {i+1:>3}. {name:<6} {n['start']:.3f}–{n['end']:.3f}s "
+                   f"({dur_ms:.0f}ms) vel={n['velocity_raw']}")
+   if len(note_events) > 40:
+       logger.info(f"  ... and {len(note_events) - 40} more")
+
+   hop = 512
+   n_frames = int(np.ceil(len(y) / hop))
+   dummy_times = librosa.frames_to_time(np.arange(n_frames), sr=sr,
+                                        hop_length=hop)
+   dummy_f0 = np.full(n_frames, np.nan)
+   dummy_voiced = np.zeros(n_frames, dtype=bool)
+   dummy_probs = np.zeros(n_frames, dtype=float)
+
+   return note_events, dummy_f0, dummy_voiced, dummy_probs, dummy_times
+
+
+# ---------------------------------------------------------------------------
 # Main analysis
 # ---------------------------------------------------------------------------
 
@@ -1083,9 +1283,15 @@ def analyze_audio(audio_file):
            os.unlink(wav_path)
 
 
-       # --- Frame-by-frame note detection ------------------------------------
-       notes, f0, voiced_flag, voiced_probs, pyin_times = \
-           detect_notes_framewise(y, sr)
+       # --- Note detection (try Onsets-and-Frames first, fall back to CQT) --
+       try:
+           notes, f0, voiced_flag, voiced_probs, pyin_times = \
+               detect_notes_onsets_frames(y, sr)
+           logger.info("Onsets-and-Frames transcription succeeded")
+       except Exception as of_err:
+           logger.info(f"O&F unavailable ({of_err}), falling back to CQT pipeline")
+           notes, f0, voiced_flag, voiced_probs, pyin_times = \
+               detect_notes_framewise(y, sr)
 
 
        # --- Tempo / beat tracking --------------------------------------------
