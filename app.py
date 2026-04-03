@@ -1,4 +1,5 @@
 import streamlit as st
+from streamlit.errors import StreamlitAPIException
 import librosa
 import numpy as np
 import json
@@ -13,6 +14,15 @@ import traceback
 from collections import Counter
 from scipy.signal import find_peaks
 import soundfile as sf
+
+try:
+    st.set_page_config(
+        page_title="DAWAgent - Audio to MIDI",
+        page_icon="🎵",
+        layout="wide",
+    )
+except StreamlitAPIException:
+    pass
 
 # Configure logging
 logging.basicConfig(
@@ -30,41 +40,6 @@ AudioSegment.ffprobe = "/opt/homebrew/bin/ffprobe"
 # Instead of hardcoding the ffmpeg path, we could also implement a check to see if ffmpeg is available in the system PATH and use it directly. Right now, running this locally causes no issues, but would break on some machines upon deployment, specifically for MP3 and M4A files. WAV files remain unaffected as they skip the pydub conversion.
 # Using a dynamic configuration approach would make the code more portable across different environments without requiring users to modify the code for their specific ffmpeg installation.
 
-'''
-import shutil
-
-def _configure_ffmpeg():
-    candidate = shutil.which("ffmpeg")
-    
-    if candidate is None:
-        fallback = [
-            "/opt/homebrew/bin/ffmpeg", # macOS for older Apple machines
-            "/usr/local/bin/ffmpeg",    # Intel or manual installations
-            "/usr/bin/ffmpeg",          # Linux
-        ]
-        
-        for path in fallback:
-            if os.path.isfile(path):
-                candidate = path
-                break
-    
-    if candidate is None:
-        logger.warning(
-            "ffmpeg not found. MP3 and M4A files will not be supported."
-            "Install ffmpeg and ensure it's in your system PATH."
-        )
-        return
-    
-    AudioSegment.converter = candidate
-    AudioSegment.ffmpeg = candidate
-    
-    ffprobe = shutil.which("ffprobe") or candidate.replace("ffmpeg", "ffprobe")
-    AudioSegment.ffprobe = ffprobe
-    
-    logger.info(f"ffmpeg configured: {candidate}")
-
-_configure_ffmpeg()
-'''
 
 
 # ---------------------------------------------------------------------------
@@ -968,10 +943,6 @@ def detect_notes_framewise(y, sr):
 
    return note_events, f0, voiced_flag, voiced_probs, cqt_times
 
-'''
-50ms minimum duration one problem when transcribing "Für Elise" – the short grace notes get filtered out.  We could consider lowering this threshold to about 25ms or by making it adaptive based on tempo."
-"Für Elise" has plenty of rapid 16th and 32nd notes which we saw were not being transcribed in the output.
-'''
 def _emit_note(note_events, pitch, start_frame, end_frame, cqt_times, C,
               fmin_midi, num_frames, global_cqt_max, min_duration=0.03):
    """Helper: create a note event if it meets minimum duration and energy."""
@@ -1041,6 +1012,16 @@ def detect_notes_onsets_frames(y, sr):
    import torch
    from piano_transcription_inference import PianoTranscription, sample_rate as PT_SR
 
+   # --- Single sensitivity preset (O&F + filters aligned) --------------------
+   # Lower thresholds → more onsets/frames kept; softer velocity cutoffs →
+   # short melody (e.g. G4/A4 ~vel 45) survives early, phantom, and final passes.
+   OF_ONSET_TH = 0.32
+   OF_FRAME_TH = 0.10
+   SOFT_VEL = 42
+   SHORT_NOTE_SEC = 0.11
+   PHANTOM_WEAK_VEL = 38
+   FINAL_LONG_SEC = 0.09
+
    logger.info("=" * 80)
    logger.info("Using Onsets-and-Frames (ByteDance) for transcription")
    logger.info("=" * 80)
@@ -1053,10 +1034,13 @@ def detect_notes_onsets_frames(y, sr):
 
    transcriptor = PianoTranscription(device=torch.device('cpu'),
                                      checkpoint_path=None)
-   transcriptor.onset_threshold = 0.5
-   transcriptor.frame_threshold = 0.2
+   transcriptor.onset_threshold = OF_ONSET_TH
+   transcriptor.frame_threshold = OF_FRAME_TH
 
-   logger.info("Running Onsets-and-Frames inference (onset=0.5, frame=0.2)...")
+   logger.info(
+       "Running Onsets-and-Frames inference (onset=%.2f, frame=%.2f)...",
+       OF_ONSET_TH, OF_FRAME_TH,
+   )
    transcribed = transcriptor.transcribe(y_rs, midi_path=None)
 
    est_notes = transcribed['est_note_events']
@@ -1072,7 +1056,7 @@ def detect_notes_onsets_frames(y, sr):
        dur = offset - onset
        if dur < 0.03:
            continue
-       if dur < 0.12 and vel < 50:
+       if dur < SHORT_NOTE_SEC and vel < SOFT_VEL:
            continue
 
        note_events.append({
@@ -1085,30 +1069,97 @@ def detect_notes_onsets_frames(y, sr):
    note_events.sort(key=lambda n: (n['start'], n['pitch']))
    logger.info(f"O&F note events after basic filtering: {len(note_events)}")
 
-   # --- Patch: detect the first note near t=0 that O&F misses --------------
-   EARLY_THRESHOLD = 0.15
-   first_of_onset = note_events[0]['start'] if note_events else 0.0
+   # --- Patch: always detect notes at t=0 that O&F misses --------------------
+   # O&F often misses the very first note.  Use CQT to detect IF there's energy
+   # at the start.  For pitch: when O&F's first note starts late (>0.2s), the
+   # opening is likely a sustained single note (e.g. Turkish March B3) — use
+   # O&F's first pitch.  When O&F starts early (e.g. Für Elise trill at 0.24s),
+   # the note at 0.0 may differ — use CQT strongest bin in melody range (C3–C6).
+   SCAN_WINDOW = 0.25
+   first_of_onset = note_events[0]['start'] if note_events else SCAN_WINDOW
+   first_pitch = note_events[0]['pitch'] if note_events else None
+   hop_e = 512
+   fmin_hz = librosa.note_to_hz('C2')
+   fmin_midi_e = int(round(librosa.hz_to_midi(fmin_hz)))
+   scan_samples = min(int(SCAN_WINDOW * sr), len(y))
 
-   if first_of_onset > EARLY_THRESHOLD:
-       logger.info(f"O&F first note starts at {first_of_onset:.3f}s — "
-                   f"detecting opening note with CQT...")
-       fmin_hz = librosa.note_to_hz('C2')
-       fmin_midi_e = int(round(librosa.hz_to_midi(fmin_hz)))
-       scan_samples = min(int(first_of_onset * sr), len(y))
+   if scan_samples >= hop_e * 2 and first_of_onset > 0.04:
        C_early = np.abs(librosa.cqt(
            y[:scan_samples], sr=sr, fmin=fmin_hz, n_bins=84,
-           hop_length=512, bins_per_octave=12))
-       strongest_bin = int(np.argmax(np.mean(C_early, axis=1)))
-       first_pitch = fmin_midi_e + strongest_bin
+           hop_length=hop_e, bins_per_octave=12))
+       global_max = float(np.max(C_early)) if C_early.size > 0 else 0.0
+       n_frames_early = C_early.shape[1]
 
-       note_events.insert(0, {
-           'pitch': int(first_pitch),
-           'start': 0.0,
-           'end': float(first_of_onset - 0.005),
-           'velocity_raw': 70,
-       })
-       logger.info(f"  Inserted opening note: {midi_to_note_name(first_pitch)} "
-                   f"0.000–{first_of_onset - 0.005:.3f}s")
+       has_start_energy = False
+       if n_frames_early >= 3 and global_max > 1e-6:
+           first_frames = C_early[:, :3]
+           frame_max = float(np.max(first_frames))
+           if frame_max > global_max * 0.06:
+               has_start_energy = True
+
+       if has_start_energy:
+           insert_pitch = None
+           pitch_src = None
+
+           if first_of_onset < 0.24:
+               f0_pyin, voiced, _ = librosa.pyin(
+                   y[:scan_samples], fmin=80, fmax=400, sr=sr, hop_length=hop_e)
+               valid = np.isfinite(f0_pyin) & (f0_pyin > 0)
+               pyin_pitch = None
+               if np.any(valid):
+                   median_hz = float(np.median(f0_pyin[valid]))
+                   pyin_pitch = int(round(librosa.hz_to_midi(median_hz)))
+
+               bin_energies = np.max(C_early[:, :min(5, n_frames_early)], axis=1)
+               c3_bin, c6_bin = 12, 60
+               melody_slice = bin_energies[c3_bin:c6_bin]
+               cqt_melody_pitch = None
+               if melody_slice.size > 0:
+                   strongest_in_range = int(np.argmax(melody_slice)) + c3_bin
+                   cqt_melody_pitch = fmin_midi_e + strongest_in_range
+
+               if pyin_pitch is not None and cqt_melody_pitch is not None:
+                   if pyin_pitch % 12 == cqt_melody_pitch % 12:
+                       insert_pitch = cqt_melody_pitch
+                       pitch_src = "pyin+CQT"
+                   else:
+                       insert_pitch = pyin_pitch
+                       pitch_src = "pyin"
+               elif pyin_pitch is not None:
+                   insert_pitch = pyin_pitch
+                   pitch_src = "pyin"
+               elif cqt_melody_pitch is not None:
+                   insert_pitch = cqt_melody_pitch
+                   pitch_src = "CQT melody"
+
+           if insert_pitch is None and first_of_onset >= 0.24:
+               bin_energies = np.max(C_early[:, :min(5, n_frames_early)], axis=1)
+               c3_bin, c6_bin = 12, 60
+               melody_slice = bin_energies[c3_bin:c6_bin]
+               if melody_slice.size > 0:
+                   strongest_in_range = int(np.argmax(melody_slice)) + c3_bin
+                   insert_pitch = fmin_midi_e + strongest_in_range
+                   pitch_src = "CQT melody"
+
+           if insert_pitch is None and first_pitch is not None:
+               insert_pitch = first_pitch
+               pitch_src = "O&F"
+           elif insert_pitch is None:
+               insert_pitch = 60
+               pitch_src = "default"
+
+           end_t = min(first_of_onset - 0.005, SCAN_WINDOW - 0.02)
+           if end_t > 0.03:
+               note_events.insert(0, {
+                   'pitch': int(insert_pitch),
+                   'start': 0.0,
+                   'end': float(end_t),
+                   'velocity_raw': 70,
+               })
+               note_events.sort(key=lambda n: (n['start'], n['pitch']))
+               logger.info(
+                   f"  Inserted note at 0.0: {midi_to_note_name(insert_pitch)} "
+                   f"0.000–{end_t:.3f}s (pitch from {pitch_src})")
 
    # --- Post-processing: remove weak phantom notes --------------------------
    # When a weak note (low velocity) starts within 100ms of a much stronger
@@ -1127,7 +1178,7 @@ def detect_notes_onsets_frames(y, sr):
                continue
            if (a['velocity_raw'] > 0 and
                b['velocity_raw'] / a['velocity_raw'] < PHANTOM_VEL_RATIO and
-               b['velocity_raw'] < 50):
+               b['velocity_raw'] < PHANTOM_WEAK_VEL):
                phantoms.add(j)
                logger.info(
                    f"  Phantom removed: {midi_to_note_name(b['pitch'])} "
@@ -1143,7 +1194,7 @@ def detect_notes_onsets_frames(y, sr):
    all_starts = sorted(set(n['start'] for n in note_events))
    for n in note_events:
        dur = n['end'] - n['start']
-       if dur < 0.15 and n['velocity_raw'] >= 50:
+       if dur < 0.15 and n['velocity_raw'] >= SOFT_VEL:
            later = [t for t in all_starts if t > n['start'] + 0.05]
            if later:
                new_end = later[0] - 0.005
@@ -1201,8 +1252,9 @@ def detect_notes_onsets_frames(y, sr):
            trimmed_tail += 1
 
    note_events = [n for n in note_events
-                  if (n['end'] - n['start'] >= 0.12) or
-                     (n['end'] - n['start'] >= 0.03 and n['velocity_raw'] >= 50)]
+                  if (n['end'] - n['start'] >= FINAL_LONG_SEC) or
+                     (n['end'] - n['start'] >= 0.03 and
+                      n['velocity_raw'] >= SOFT_VEL)]
    note_events.sort(key=lambda n: (n['start'], n['pitch']))
 
    logger.info(f"O&F post-processed: {len(note_events)} events "
@@ -1225,6 +1277,11 @@ def detect_notes_onsets_frames(y, sr):
    dummy_probs = np.zeros(n_frames, dtype=float)
 
    return note_events, dummy_f0, dummy_voiced, dummy_probs, dummy_times
+
+
+# ---------------------------------------------------------------------------
+# Transcription uses the loaded mono mix as-is (no Demucs / DeepFilterNet).
+# ---------------------------------------------------------------------------
 
 
 # ---------------------------------------------------------------------------
@@ -1281,6 +1338,11 @@ def analyze_audio(audio_file):
 
        if wav_path and os.path.exists(wav_path):
            os.unlink(wav_path)
+
+
+       preprocess_log = ["none (raw audio)"]
+       logger.info("Preprocessing: raw audio (no separation / denoise)")
+       duration = len(y) / sr
 
 
        # --- Note detection (try Onsets-and-Frames first, fall back to CQT) --
@@ -1355,6 +1417,7 @@ def analyze_audio(audio_file):
            'duration': float(duration),
            'spectral_centroids': spectral_centroids,
            'spectral_rolloff': spectral_rolloff,
+           'preprocessing': preprocess_log,
        }
 
 
@@ -1571,16 +1634,11 @@ def _fmt_dur(note):
 
 
 def main():
-   st.set_page_config(
-       page_title="DAWAgent - Audio to MIDI",
-       page_icon="🎵",
-       layout="wide",
+   st.title("🎵 DAWAgent – MIDI Transcription")
+   st.markdown(
+       "Upload audio; **Onsets-and-Frames** (ByteDance) or **CQT** fallback, "
+       "then MIDI + JSON export. No source separation or denoise step."
    )
-
-
-   st.title("🎵 DAWAgent – Audio to MIDI Transcription")
-   st.markdown("Upload audio files and convert them to MIDI with accurate "
-               "pitch detection and transcription.")
    st.markdown("---")
 
 
@@ -1635,6 +1693,11 @@ def main():
 
                    if result['success']:
                        st.success("Audio analysis complete!")
+                       prep = result.get("preprocessing", [])
+                       st.caption(
+                           "**Preprocessing:** "
+                           + (" → ".join(prep) if prep else "none")
+                       )
 
 
                        col_a, col_b, col_c = st.columns(3)
@@ -1703,30 +1766,15 @@ def main():
    with st.sidebar:
        st.header("ℹ️ About")
        st.markdown("""
-       **DAWAgent** transcribes audio files to MIDI.
+       **DAWAgent** transcribes the uploaded mix directly to MIDI.
 
 
        **Supported formats:** WAV, MP3, M4A
 
 
-       **Features:**
-       - Frame-by-frame polyphonic note tracking
-       - Overlapping note support (chords + melody)
-       - Monophonic pitch refinement (pYIN)
-       - CQT-based spectral analysis
-       - Tempo and beat tracking
-       - Velocity detection
-       - Chord identification
-       - MIDI file generation
-       - JSON metadata export
-
-
-       **How it works:**
-       1. Upload your audio file
-       2. Click "Generate MIDI Transcription"
-       3. Audio is analysed frame-by-frame for all active pitches
-       4. Notes are tracked independently with start/end times
-       5. Download the MIDI file and open in your DAW
+       **Pipeline:**
+       1. Onsets-and-Frames (ByteDance) or CQT fallback
+       2. MIDI + JSON export
        """)
 
 
@@ -1740,5 +1788,5 @@ def main():
            st.write("No files uploaded yet")
 
 
-if __name__ == "__main__":
-   main()
+# Streamlit's runner may not set __name__ to "__main__".
+main()
